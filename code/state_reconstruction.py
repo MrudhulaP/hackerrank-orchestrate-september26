@@ -1,36 +1,37 @@
 """
 state_reconstruction.py
 
-Turns the raw financial_events.csv rows for one user into:
-  1. A list of concrete forward-looking events (pending/scheduled items that
-     land inside the forecast window as explicit rows), and
-  2. A list of detected RECURRING SERIES (rent, salary, subscriptions, etc.)
-     inferred from historical settled events, so they can be projected
-     forward into the 90-day forecast (the dataset only gives historical
-     occurrences + at most one "next confirmed salary" row per user - it
-     does NOT pre-populate future rent/utility/subscription rows).
+Turns raw financial_events.csv rows for one user into:
+  1. Concrete forward-looking events (pending/scheduled items inside window)
+  2. Projected recurring series (rent, salary, subscriptions, etc.)
 
-Conflict-resolution and exclusion rules applied here (per problem_statement.md):
-  - status in {cancelled, failed}            -> excluded entirely
-  - status == pending AND direction == credit -> excluded (pending credits ignored)
-  - status == pending AND direction == debit  -> kept (only pending credits are
-    excluded per the spec; pending debits represent likely real spending)
-  - status == settled  -> historical fact; used for recurrence detection, but
-    NOT re-applied to the forward balance (current_available_balance in
-    financial_profiles.csv already reflects settled history)
-  - status == scheduled -> a confirmed future event (e.g. next salary);
-    applied on settlement_date if that date falls inside the forecast window
-  - linked_event_id chains (authorization -> settlement, charge -> refund):
-    since cancelled/failed rows are dropped and only the settled/scheduled
-    replacement survives, this naturally implements "prefer explicit
-    cancellation/settlement/amendment" without extra bookkeeping.
+Rules per problem_statement.md:
+  - cancelled / failed              → excluded
+  - pending credit                  → excluded (unconfirmed income)
+  - unrealized / non_cash           → excluded (no real cash flow)
+  - pending debit                   → included (likely real spending)
+  - settled                         → history for recurrence detection only
+  - scheduled                       → concrete future event
+
+FX:
+  Each event amount is converted to home_currency before recurrence detection
+  so typical_amount always reflects the home-currency value.
+
+Salary-stream rules:
+  1. If ALL salary credits look like variable gig payouts → don't project.
+  2. If the last salary description signals termination ("final", "ended") → don't project.
+  3. Try to split into distinct streams by description cluster; only do so when
+     there are ≥ 2 description groups each with ≥ 2 occurrences. Otherwise treat
+     all salary events as one stream (handles user_01 who has only 2 salary records).
+  4. Drop any salary stream whose last occurrence is > 1.5 × interval days before
+     request_date (stream has lapsed — handles user_13's ended secondary income).
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import timedelta
 from statistics import median
 from typing import Optional
 
@@ -39,100 +40,163 @@ from utils import DATE_FMT, days_between, parse_date, safe_float
 
 EXCLUDED_STATUSES = {"cancelled", "failed"}
 
+SALARY_TERMINATION_KEYWORDS = [
+    "final employer payroll",
+    "final payroll",
+    "last payroll",
+    "last salary",
+    "employment has ended",
+    "employment ended",
+    "contract has ended",
+    "seasonal contract has ended",
+    "no off-season income",
+]
+
+GIG_INCOME_KEYWORDS = [
+    "platform payout",
+    "app earnings",
+    "marketplace payout",
+    "driver platform payout",
+    "gig payout",
+    "freelance payout",
+    "task payout",
+    "task marketplace payout",
+    "weekly app earnings",
+    "delivery platform payout",
+]
+
 
 @dataclass
 class ForwardEvent:
-    """A single, concrete, dated cash-flow event to apply during simulation."""
     event_id: str
-    date: str            # settlement_date - the date balance actually moves
-    amount: float        # signed: positive for credit, negative for debit
+    date: str
+    amount: float          # signed: positive=credit, negative=debit
     category: str
-    flexibility: str     # fixed | stoppable | reducible | reducible_or_stoppable
+    flexibility: str
     minimum_allowed_amount: Optional[float]
-    source: str          # "one_off" | "recurring"
-    series_key: Optional[str] = None  # set for recurring occurrences
+    source: str            # "one_off" | "recurring"
+    series_key: Optional[str] = None
 
 
 @dataclass
 class RecurringSeries:
-    """A detected recurring pattern (e.g. monthly rent, monthly salary)."""
     series_key: str
     user_id: str
     category: str
     description: str
-    direction: str          # debit | credit
+    direction: str
     typical_amount: float
-    interval_days: int      # median gap between historical occurrences
-    last_date: str          # most recent historical (or scheduled) occurrence
+    interval_days: int
+    last_date: str
     flexibility: str
     minimum_allowed_amount: Optional[float]
-    day_of_month_anchor: int  # approx day-of-month to project onto
+    day_of_month_anchor: int
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def signed_amount(direction: str, amount: float) -> float:
     return amount if direction == "credit" else -amount
-
-
-def load_user_raw_events(all_events: list[dict], user_id: str) -> list[dict]:
-    return [e for e in all_events if e.get("user_id") == user_id]
 
 
 def _is_excluded(raw: dict) -> bool:
     status = (raw.get("status") or "").strip().lower()
     if status in EXCLUDED_STATUSES:
         return True
-    if status == "pending" and (raw.get("direction") or "").strip().lower() == "credit":
+    direction = (raw.get("direction") or "").strip().lower()
+    if status == "pending" and direction == "credit":
+        return True
+    if status == "unrealized":
+        return True
+    if (raw.get("event_type") or "").strip().lower() == "non_cash":
         return True
     return False
 
 
-def resolve_event_amount(raw: dict, images_by_related_event: dict[str, list[dict]],
-                          image_amount_lookup) -> Optional[float]:
-    """
-    Resolve a possibly-blank amount. Never treat blank as zero.
-    `image_amount_lookup(image_id)` is a callable you implement to read the
-    amount out of dataset/media/images/<image_id>.png (vision LLM or OCR).
-    """
+def _is_gig_income(row: dict) -> bool:
+    desc = (row.get("description") or "").lower()
+    return any(kw in desc for kw in GIG_INCOME_KEYWORDS)
+
+
+def _is_salary_terminated(last_row: dict) -> bool:
+    desc = (last_row.get("description") or "").lower()
+    return any(kw in desc for kw in SALARY_TERMINATION_KEYWORDS)
+
+
+def _series_overdue(last_date: str, interval_days: int, request_date: str) -> bool:
+    """True when last known occurrence is > 1.5 × interval before request_date."""
+    try:
+        gap = days_between(last_date, request_date)
+        threshold = max(int(interval_days * 1.5), interval_days + 14)
+        return gap > threshold
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Amount resolution with FX
+# ---------------------------------------------------------------------------
+
+def resolve_event_amount(
+    raw: dict,
+    images_by_related_event: dict,
+    image_amount_lookup,
+    home_currency: str = "",
+    fx=None,
+    fallback_date: str = "",
+) -> Optional[float]:
+    """Resolve blank amount via image lookup, then FX-convert to home_currency."""
     amount = safe_float(raw.get("amount"))
-    if amount is not None:
-        return amount
+    if amount is None:
+        event_id = raw.get("event_id")
+        imgs = images_by_related_event.get(event_id, [])
+        if not imgs:
+            return None
+        amount = image_amount_lookup(imgs[0]["image_id"])
+        if amount is None:
+            return None
 
-    event_id = raw.get("event_id")
-    linked_images = images_by_related_event.get(event_id, [])
-    if not linked_images:
-        return None  # genuinely unresolved - handle conservatively downstream
+    if fx and home_currency:
+        event_ccy = (raw.get("currency") or "").strip()
+        if event_ccy and event_ccy != home_currency:
+            settle_date = (raw.get("settlement_date") or "").strip() or fallback_date
+            try:
+                rate = fx.get_rate(settle_date, event_ccy, home_currency)
+                amount = amount * rate
+            except Exception:
+                pass
 
-    return image_amount_lookup(linked_images[0]["image_id"])
+    return amount
 
+
+# ---------------------------------------------------------------------------
+# History / forward split
+# ---------------------------------------------------------------------------
 
 def build_forward_and_history(
     raw_events: list[dict],
-    images_by_related_event: dict[str, list[dict]],
+    images_by_related_event: dict,
     image_amount_lookup,
+    home_currency: str = "",
+    fx=None,
+    fallback_date: str = "",
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Split cleaned (non-excluded, amount-resolved) events into:
-      - history: status == settled  (used only for recurrence detection)
-      - forward_candidates: status in {pending, scheduled} (concrete future rows)
-    Each returned dict is the original raw row plus a resolved 'amount' float.
-    """
     history: list[dict] = []
     forward_candidates: list[dict] = []
 
     for raw in raw_events:
         if _is_excluded(raw):
             continue
-
-        amount = resolve_event_amount(raw, images_by_related_event, image_amount_lookup)
+        amount = resolve_event_amount(
+            raw, images_by_related_event, image_amount_lookup,
+            home_currency, fx, fallback_date,
+        )
         if amount is None:
-            # Could not resolve - conservative choice: skip rather than
-            # guess. Document this decision in decision_explanation upstream
-            # if it affects a specific request.
             continue
-
         row = dict(raw)
         row["amount"] = amount
-
         status = (raw.get("status") or "").strip().lower()
         if status == "settled":
             history.append(row)
@@ -142,114 +206,235 @@ def build_forward_and_history(
     return history, forward_candidates
 
 
-def detect_recurring_series(history: list[dict], user_id: str) -> list[RecurringSeries]:
-    """
-    Group historical settled events by (category, direction) and treat a
-    group as a recurring series if it has >= 2 occurrences with a roughly
-    consistent interval (approximately monthly, weekly, etc.).
+# ---------------------------------------------------------------------------
+# Recurring-series detection
+# ---------------------------------------------------------------------------
 
-    IMPORTANT: we deliberately do NOT include `description` in the grouping
-    key. Verified against the real dataset (e.g. user_01's weekly groceries):
-    the same underlying recurring expense rotates through several synonym
-    descriptions ("Neighbourhood grocer", "Bulk pantry shop", "Fresh food
-    shop", ...) at a genuinely weekly cadence. Grouping by (category,
-    description) fragments one true weekly series into ~5-7 fake series that
-    each only recur every 35-49 days, which either gets filtered out
-    (interval > 45) or wildly understates true spending frequency - this
-    silently corrupted amount_safe_to_pay for most users. `direction` is
-    kept in the key (rather than category alone) so an occasional refund
-    credit in an otherwise all-debit category doesn't get merged into the
-    expense series and flip its projected sign.
+def _build_series_from_rows(
+    rows: list[dict],
+    category: str,
+    direction: str,
+    series_key: str,
+    user_id: str,
+    request_date: str = "",
+    min_interval: int = 3,
+    max_interval: int = 45,
+    check_termination: bool = False,
+    check_overdue: bool = False,
+) -> Optional[RecurringSeries]:
+    """Build one RecurringSeries from a sorted list of rows, or None if invalid."""
+    if len(rows) < 2:
+        return None
 
-    This is a heuristic (documented in usage_report.md / README as an
-    assumption): the dataset supplies rich historical detail but only
-    explicit *future* rows for pending/scheduled items, so recurring
-    obligations (rent, subscriptions, salary, groceries, etc.) must be
-    projected forward from their historical pattern.
+    rows_sorted = sorted(rows, key=lambda r: r["settlement_date"])
+    dates = [r["settlement_date"] for r in rows_sorted]
+    gaps = [days_between(dates[i], dates[i + 1]) for i in range(len(dates) - 1)]
+    gaps = [g for g in gaps if g > 0]
+    if not gaps:
+        return None
+
+    interval = int(round(median(gaps)))
+    if interval < min_interval or interval > max_interval:
+        return None
+
+    last_row = rows_sorted[-1]
+
+    if check_termination and _is_salary_terminated(last_row):
+        return None
+
+    if check_overdue and request_date and _series_overdue(
+            last_row["settlement_date"], interval, request_date):
+        return None
+
+    recent_amounts = [v for r in rows_sorted[-3:]
+                      if (v := safe_float(r["amount"], 0.0)) is not None]
+    typical_amount = median(recent_amounts) if recent_amounts else 0.0
+
+    recent_descs = [r.get("description", "") for r in rows_sorted[-5:]]
+    display_desc = max(set(recent_descs), key=recent_descs.count)
+
+    return RecurringSeries(
+        series_key=series_key,
+        user_id=user_id,
+        category=category,
+        description=display_desc,
+        direction=direction,
+        typical_amount=typical_amount,
+        interval_days=interval,
+        last_date=last_row["settlement_date"],
+        flexibility=last_row.get("flexibility", "fixed"),
+        minimum_allowed_amount=safe_float(last_row.get("minimum_allowed_amount")),
+        day_of_month_anchor=parse_date(last_row["settlement_date"]).day,
+    )
+
+
+def _salary_description_key(row: dict) -> str:
+    """First 3 words of the description as a soft stream cluster key."""
+    desc = (row.get("description") or "").strip().lower()
+    return " ".join(desc.split()[:3])
+
+
+def detect_recurring_series(
+    history: list[dict],
+    user_id: str,
+    request_date: str = "",
+    salary_stop: bool = False,
+    salary_override_amount: Optional[float] = None,
+    salary_override_next_date: Optional[str] = None,
+) -> list[RecurringSeries]:
     """
-    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    Detect all recurring expense and income series.
+
+    salary_stop: suppress all projected salary (gig income signalled as pending).
+    salary_override_amount: replace typical_amount for salary series (from message).
+    salary_override_next_date: shift last_date so next projection hits this date.
+    """
+    series_list: list[RecurringSeries] = []
+
+    # ---- Non-salary categories (grouped by category+direction) ----
+    groups: dict[tuple, list] = defaultdict(list)
     for row in history:
-        key = (row.get("category", ""), row.get("direction", ""))
+        cat = row.get("category", "")
+        if cat == "salary":
+            continue
+        key = (cat, row.get("direction", ""))
         groups[key].append(row)
 
-    series_list: list[RecurringSeries] = []
     for (category, direction), rows in groups.items():
-        if len(rows) < 2:
-            continue  # not enough data to call it recurring
+        s = _build_series_from_rows(
+            rows, category, direction,
+            series_key=f"{user_id}::{category}::{direction}",
+            user_id=user_id, request_date=request_date,
+        )
+        if s:
+            series_list.append(s)
 
-        rows_sorted = sorted(rows, key=lambda r: r["settlement_date"])
-        dates = [r["settlement_date"] for r in rows_sorted]
-        gaps = [days_between(dates[i], dates[i + 1]) for i in range(len(dates) - 1)]
-        gaps = [g for g in gaps if g > 0]
-        if not gaps:
-            continue
+    # ---- Salary income ----
+    if salary_stop:
+        return series_list
 
-        interval = int(round(median(gaps)))
-        # Only treat as recurring if the interval looks like a real cadence
-        # (roughly weekly to roughly monthly-ish); otherwise it's probably
-        # irregular one-off spending in the same category (e.g. "groceries"
-        # bought at random intervals still recurs frequently enough to count).
-        if interval < 3 or interval > 45:
-            continue
+    salary_rows = [r for r in history
+                   if r.get("category") == "salary"
+                   and r.get("direction", "").strip().lower() == "credit"]
 
-        last_row = rows_sorted[-1]
-        recent_amounts = [safe_float(r["amount"], 0.0) for r in rows_sorted[-3:]]
-        typical_amount = median(recent_amounts)
+    if not salary_rows:
+        return series_list
 
-        # Most common description among recent occurrences, purely for the
-        # human-readable series description - never used for grouping/keys.
-        recent_descriptions = [r.get("description", "") for r in rows_sorted[-5:]]
-        display_description = max(set(recent_descriptions), key=recent_descriptions.count)
+    # If ALL salary records look like gig income → don't project
+    if all(_is_gig_income(r) for r in salary_rows):
+        return series_list
 
-        series_key = f"{user_id}::{category}::{direction}"
-        series_list.append(RecurringSeries(
-            series_key=series_key,
-            user_id=user_id,
-            category=category,
-            description=display_description,
-            direction=last_row.get("direction", "debit"),
-            typical_amount=typical_amount,
-            interval_days=interval,
-            last_date=last_row["settlement_date"],
-            flexibility=last_row.get("flexibility", "fixed"),
-            minimum_allowed_amount=safe_float(last_row.get("minimum_allowed_amount")),
-            day_of_month_anchor=parse_date(last_row["settlement_date"]).day,
-        ))
+    # Attempt description-based stream splitting ONLY when there are clearly
+    # ≥ 2 distinct groups each with ≥ 2 occurrences (multi-income household).
+    # For single-stream users (e.g. user_01 with 1-2 records), fall back to
+    # treating all salary as one stream so we don't lose the series entirely.
+    desc_groups: dict[str, list] = defaultdict(list)
+    for row in salary_rows:
+        desc_groups[_salary_description_key(row)].append(row)
+
+    qualifying_subgroups = {k: v for k, v in desc_groups.items() if len(v) >= 2}
+
+    if len(qualifying_subgroups) >= 2:
+        # Multiple distinct salary streams (e.g. primary + secondary household)
+        for stream_key, rows in qualifying_subgroups.items():
+            s = _build_series_from_rows(
+                rows, "salary", "credit",
+                series_key=f"{user_id}::salary::{stream_key}",
+                user_id=user_id, request_date=request_date,
+                min_interval=14, max_interval=45,
+                check_termination=True,
+                check_overdue=True,
+            )
+            if s:
+                s = _apply_salary_overrides(s, salary_override_amount,
+                                            salary_override_next_date)
+                series_list.append(s)
+    else:
+        # Single salary stream (most users).
+        # Use the dominant (largest) qualifying subgroup when available to avoid
+        # corrupting interval/last_date with one-off bonuses or arrears payments.
+        # Fall back to all salary_rows only when no subgroup qualifies (e.g. new job,
+        # only 2 records total with different descriptions).
+        if qualifying_subgroups:
+            dominant_key = max(qualifying_subgroups, key=lambda k: len(qualifying_subgroups[k]))
+            stream_rows = qualifying_subgroups[dominant_key]
+        else:
+            stream_rows = salary_rows
+
+        s = _build_series_from_rows(
+            stream_rows, "salary", "credit",
+            series_key=f"{user_id}::salary::credit",
+            user_id=user_id, request_date=request_date,
+            min_interval=14, max_interval=45,
+            check_termination=True,
+            check_overdue=False,  # don't drop single-stream salary as overdue
+        )
+        if s:
+            s = _apply_salary_overrides(s, salary_override_amount,
+                                        salary_override_next_date)
+            series_list.append(s)
 
     return series_list
 
+
+def _apply_salary_overrides(
+    s: RecurringSeries,
+    override_amount: Optional[float],
+    override_next_date: Optional[str],
+) -> RecurringSeries:
+    """Return an updated RecurringSeries with message-driven overrides applied."""
+    if override_amount is not None:
+        s = RecurringSeries(
+            series_key=s.series_key, user_id=s.user_id,
+            category=s.category, description=s.description,
+            direction=s.direction, typical_amount=override_amount,
+            interval_days=s.interval_days, last_date=s.last_date,
+            flexibility=s.flexibility,
+            minimum_allowed_amount=s.minimum_allowed_amount,
+            day_of_month_anchor=s.day_of_month_anchor,
+        )
+    if override_next_date is not None:
+        try:
+            new_last = parse_date(override_next_date) - timedelta(days=s.interval_days)
+            s = RecurringSeries(
+                series_key=s.series_key, user_id=s.user_id,
+                category=s.category, description=s.description,
+                direction=s.direction, typical_amount=s.typical_amount,
+                interval_days=s.interval_days,
+                last_date=new_last.strftime(DATE_FMT),
+                flexibility=s.flexibility,
+                minimum_allowed_amount=s.minimum_allowed_amount,
+                day_of_month_anchor=s.day_of_month_anchor,
+            )
+        except Exception:
+            pass
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Forward projection
+# ---------------------------------------------------------------------------
 
 def project_recurring_occurrences(
     series: RecurringSeries,
     window_start: str,
     window_end: str,
 ) -> list[ForwardEvent]:
-    """
-    Project a recurring series forward from its last known occurrence,
-    stepping by its detected interval, emitting one ForwardEvent per
-    occurrence that falls within [window_start, window_end].
-    """
     occurrences: list[ForwardEvent] = []
-    current = parse_date(series.last_date)
     end_dt = parse_date(window_end)
     start_dt = parse_date(window_start)
-    step_count = 0
+    step = 0
 
     while True:
-        step_count += 1
-        # advance by interval_days each step from the last historical date
-        next_date = current
-        from datetime import timedelta
-        next_date = parse_date(series.last_date) + timedelta(days=series.interval_days * step_count)
-        if next_date > end_dt:
+        step += 1
+        next_dt = parse_date(series.last_date) + timedelta(days=series.interval_days * step)
+        if next_dt > end_dt:
             break
-        if next_date < start_dt:
+        if next_dt < start_dt:
             continue
-
-        date_str = next_date.strftime(DATE_FMT)
         occurrences.append(ForwardEvent(
-            event_id=f"{series.series_key}#{step_count}",
-            date=date_str,
+            event_id=f"{series.series_key}#{step}",
+            date=next_dt.strftime(DATE_FMT),
             amount=signed_amount(series.direction, series.typical_amount),
             category=series.category,
             flexibility=series.flexibility,
@@ -257,36 +442,49 @@ def project_recurring_occurrences(
             source="recurring",
             series_key=series.series_key,
         ))
-
     return occurrences
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def build_user_forward_events(
     raw_events: list[dict],
-    images_by_related_event: dict[str, list[dict]],
+    images_by_related_event: dict,
     image_amount_lookup,
     user_id: str,
     window_start: str,
     window_end: str,
+    home_currency: str = "",
+    fx=None,
+    salary_stop: bool = False,
+    salary_override_amount: Optional[float] = None,
+    salary_override_next_date: Optional[str] = None,
 ) -> list[ForwardEvent]:
     """
-    Full pipeline for one user: clean events -> detect recurring series ->
-    project them forward -> add concrete pending/scheduled rows that fall
-    inside the window -> return one combined, date-sorted list.
+    Full pipeline for one user:
+      1. Clean + FX-convert events
+      2. Split history vs forward candidates
+      3. Detect recurring series
+      4. Project recurring series into window
+      5. Add concrete pending/scheduled rows
+      Return date-sorted combined list.
     """
     history, forward_candidates = build_forward_and_history(
-        raw_events, images_by_related_event, image_amount_lookup
+        raw_events, images_by_related_event, image_amount_lookup,
+        home_currency=home_currency, fx=fx, fallback_date=window_start,
     )
 
     events: list[ForwardEvent] = []
 
-    # concrete pending/scheduled rows (e.g. "next confirmed salary")
+    # Concrete one-off forward events (pending debits + scheduled credits)
     for row in forward_candidates:
-        settlement_date = row["settlement_date"]
-        if window_start <= settlement_date <= window_end:
+        sd = row["settlement_date"]
+        if window_start <= sd <= window_end:
             events.append(ForwardEvent(
                 event_id=row["event_id"],
-                date=settlement_date,
+                date=sd,
                 amount=signed_amount(row.get("direction", "debit"), row["amount"]),
                 category=row.get("category", ""),
                 flexibility=row.get("flexibility", "fixed"),
@@ -294,27 +492,23 @@ def build_user_forward_events(
                 source="one_off",
             ))
 
-    # The dataset gives at most ONE explicit future income row (the "next
-    # confirmed salary", status=scheduled). Most users only have a single
-    # historical settled salary too, so detect_recurring_series alone never
-    # sees >=2 occurrences and salary is never treated as recurring - every
-    # paycheck after the one scheduled row silently disappears from the
-    # forecast, which is wrong: the spec requires forecasting with
-    # "recurring income and expenses". Fix: fold scheduled CREDIT rows into
-    # the pool used for recurrence detection (debits from forward_candidates
-    # are left out - those are genuinely one-off pending items, not income).
-    # Because last_date then becomes the scheduled row's own date, projection
-    # starts strictly after it (step_count >= 1), so the scheduled row above
-    # is never duplicated.
-    scheduled_credit_rows = [
-        row for row in forward_candidates
-        if (row.get("direction") or "").strip().lower() == "credit"
-        and (row.get("status") or "").strip().lower() == "scheduled"
+    # Fold scheduled credits into recurrence pool so projection starts after them
+    scheduled_credits = [
+        r for r in forward_candidates
+        if (r.get("direction") or "").strip().lower() == "credit"
+        and (r.get("status") or "").strip().lower() == "scheduled"
     ]
-    recurrence_source = history + scheduled_credit_rows
+    recurrence_source = history + scheduled_credits
 
-    # recurring series projected forward
-    for series in detect_recurring_series(recurrence_source, user_id):
+    series_list = detect_recurring_series(
+        recurrence_source, user_id,
+        request_date=window_start,
+        salary_stop=salary_stop,
+        salary_override_amount=salary_override_amount,
+        salary_override_next_date=salary_override_next_date,
+    )
+
+    for series in series_list:
         events.extend(project_recurring_occurrences(series, window_start, window_end))
 
     events.sort(key=lambda e: e.date)

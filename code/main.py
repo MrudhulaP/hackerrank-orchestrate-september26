@@ -8,6 +8,7 @@ Reads dataset/ from ../dataset relative to this file, writes ../output.csv.
 from __future__ import annotations
 
 import os
+import re
 from datetime import timedelta
 
 from forecast import amount_safe_to_pay, earliest_date_for_full_payment, FORECAST_DAYS
@@ -34,13 +35,8 @@ REQUIRED_OUTPUT_COLUMNS = [
 
 
 # Amounts extracted from dataset/media/images/<image_id>.png via vision
-# reading, cross-checked against each linked event's `description` field
-# (e.g. images.csv -> event_1442 "Outstanding rent balance" -> the Balance
-# Due line on the receipt, not the Amount Received line) to make sure the
-# right figure on each document is used. There are only 16 images total in
-# the dataset, so this is a fixed, hand-verified cache rather than a
-# per-run API call - fully deterministic and zero runtime cost. See
-# evaluation/usage_report.md for how this was produced.
+# reading, cross-checked against each linked event's `description` field.
+# There are only 16 images total in the dataset — fully deterministic.
 IMAGE_AMOUNT_CACHE: dict[str, float] = {
     "image_01": 4365000.0,   # payslip - Net Pay (IDR)
     "image_02": 100000.0,    # rent receipt - Balance Due (INR)
@@ -62,19 +58,163 @@ IMAGE_AMOUNT_CACHE: dict[str, float] = {
 
 
 def image_amount_lookup(image_id: str):
-    """
-    Resolve a blank financial_events.csv amount from its linked image.
-    Primary path: the hand-verified cache above (all 16 dataset images).
-    Fallback: none found -> None, so the caller conservatively skips the
-    event rather than guessing (never treat a blank amount as zero, per
-    the spec). If new images are ever added beyond the current 16, extend
-    IMAGE_AMOUNT_CACHE the same way rather than silently returning None.
-    """
     return IMAGE_AMOUNT_CACHE.get(image_id)
 
 
+# ---------------------------------------------------------------------------
+# Message parsing — extract salary signals from free-text messages
+# ---------------------------------------------------------------------------
+
+# Patterns for amounts with optional currency prefix
+_AMT = r'(?:EUR|USD|IDR|ZAR|INR|[A-Z]{3})?\s*([\d,]+(?:\.\d+)?)'
+
+# "next salary is reduced to EUR 1422.85"  /  "gaji berkurang menjadi 38760000"
+_RE_REDUCED = re.compile(
+    r'(?:salary|pay|gaji|bayaran)\s+(?:is\s+)?reduced\s+to\s+' + _AMT,
+    re.IGNORECASE
+)
+# "salary has increased to / raised to / naik menjadi 42750000"
+_RE_RAISED = re.compile(
+    r'(?:salary|gaji|pay)\s+(?:has\s+)?(?:increased?|raised?|naik(?:\s+menjadi)?)\s+(?:to\s+)?' + _AMT,
+    re.IGNORECASE
+)
+# "your salary is EUR 1529" / "confirmed salary is IDR 38760000"
+# "your temporary monthly pay is EUR 1037.52"
+_RE_CONFIRMED = re.compile(
+    r'(?:confirmed\s+)?(?:base\s+)?(?:salary|pay)\s+(?:is|of|will be)\s+' + _AMT,
+    re.IGNORECASE
+)
+# "salary confirmed for 2025-08-15" / "salary is confirmed IDR 38760000"
+# Indonesian: "gaji pokok yang dikonfirmasi adalah IDR 38760000"
+_RE_CONFIRMED2 = re.compile(
+    r'(?:salary|gaji\s+pokok).*?(?:confirmed|dikonfirmasi)\s+(?:adalah\s+)?' + _AMT,
+    re.IGNORECASE
+)
+# "first salary will be EUR 1661"
+_RE_FIRST = re.compile(
+    r'first\s+salary\s+(?:will be|of|is)\s+' + _AMT,
+    re.IGNORECASE
+)
+# "expected on 2024-09-23" — date override for next salary
+_RE_EXPECTED_DATE = re.compile(r'expected\s+on\s+(\d{4}-\d{2}-\d{2})', re.IGNORECASE)
+# "resumes? on 2025-08-15"
+_RE_RESUME_DATE = re.compile(r'resumes?\s+on\s+(\d{4}-\d{2}-\d{2})', re.IGNORECASE)
+# "confirmed credit date is 2026-01-15" / "scheduled for 2026-01-15"
+_RE_CREDIT_DATE = re.compile(
+    r'(?:confirmed\s+credit\s+date\s+is|scheduled\s+for|confirmed\s+for)\s+(\d{4}-\d{2}-\d{2})',
+    re.IGNORECASE
+)
+# "regular salary of INR 251000 resumes on 2026-01-15"
+_RE_RESUME_AMOUNT_DATE = re.compile(
+    r'(?:regular\s+salary|salary)\s+of\s+' + _AMT + r'\s+resumes?\s+on\s+(\d{4}-\d{2}-\d{2})',
+    re.IGNORECASE
+)
+# Employment / contract ended keywords
+_SALARY_END_PATTERNS = [
+    r'employment has ended',
+    r'seasonal contract has ended',
+    r'no off-season income',
+    r'contract has ended',
+    r'employment ended',
+    r'hubungan kerja.*?berakhir',      # Indonesian
+    r'kontrak musiman.*?berakhir',     # Indonesian
+    r'tidak ada pendapatan',           # Indonesian
+]
+# Gig payout pending / uncertain keywords
+_GIG_PENDING_PATTERNS = [
+    r'payout is still pending',
+    r'earnings.*?can change until',
+    r'not withdrawable until',
+    r'balance isn.*?t withdrawable',
+    r'pembayaran berikutnya.*?masih menunggu',  # Indonesian
+]
+
+
+def _parse_number(s: str) -> Optional[float]:
+    """Parse a number string that may contain commas."""
+    try:
+        return float(s.replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _extract_salary_signals(messages: list[dict], request_date: str) -> dict:
+    """
+    Parse all messages for one user/request and return a dict of salary signals:
+      salary_stop        – bool: stop projecting salary entirely
+      salary_override_amount  – float | None: replace recurring typical_amount
+      salary_override_next_date – str | None: shift next projected salary to this date
+      extra_debit_items  – list[dict]: new recurring debit signals (e.g. childcare)
+    """
+    signals = {
+        "salary_stop": False,
+        "salary_override_amount": None,
+        "salary_override_next_date": None,
+        "extra_debit_items": [],
+    }
+
+    combined_text = " ".join(m.get("message_text", "") for m in messages)
+    lower = combined_text.lower()
+
+    # --- Gig income is uncertain → don't project ---
+    if any(re.search(p, lower) for p in _GIG_PENDING_PATTERNS):
+        signals["salary_stop"] = True
+        return signals
+
+    # --- Employment / contract ended → don't project ---
+    if any(re.search(p, lower) for p in _SALARY_END_PATTERNS):
+        signals["salary_stop"] = True
+        return signals
+
+    # --- Salary resumes on a future date (gap in income) ---
+    m = re.search(_RE_RESUME_AMOUNT_DATE, combined_text)
+    if m:
+        amt = _parse_number(m.group(1))
+        resume_date = m.group(2)
+        if amt and resume_date >= request_date:
+            # No salary until resume_date; use the resumed amount
+            signals["salary_override_amount"] = amt
+            signals["salary_override_next_date"] = resume_date
+
+    m = re.search(_RE_RESUME_DATE, combined_text)
+    if m and not signals["salary_override_next_date"]:
+        resume_date = m.group(1)
+        if resume_date >= request_date:
+            signals["salary_override_next_date"] = resume_date
+
+    # --- Next salary date changed ---
+    m = re.search(_RE_EXPECTED_DATE, combined_text)
+    if m and not signals["salary_override_next_date"]:
+        signals["salary_override_next_date"] = m.group(1)
+
+    # --- Salary amount overrides (reduced / raised / confirmed / first) ---
+    # Priority: reduced > first > confirmed2 > confirmed > raised
+    for pattern in [_RE_REDUCED, _RE_FIRST, _RE_CONFIRMED2, _RE_CONFIRMED, _RE_RAISED]:
+        m = re.search(pattern, combined_text)
+        if m:
+            amt = _parse_number(m.group(1))
+            if amt and amt > 0:
+                signals["salary_override_amount"] = amt
+                break
+
+    # "confirmed credit date is" / "scheduled for" → next salary date
+    m = re.search(_RE_CREDIT_DATE, combined_text)
+    if m and not signals["salary_override_next_date"]:
+        signals["salary_override_next_date"] = m.group(1)
+
+    return signals
+
+
+# Re-export Optional so it can be used in type hints
+from typing import Any, Optional
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
 def load_all_data() -> dict:
-    data = {
+    data: dict[str, Any] = {
         "requests": load_csv(os.path.join(DATASET_DIR, "requests.csv")),
         "profiles": load_csv(os.path.join(DATASET_DIR, "financial_profiles.csv")),
         "events": load_csv(os.path.join(DATASET_DIR, "financial_events.csv")),
@@ -87,9 +227,19 @@ def load_all_data() -> dict:
     data["events_by_user"] = group_by(data["events"], "user_id")
     data["payment_options_by_request"] = group_by(data["payment_options"], "request_id")
     data["images_by_related_event"] = group_by(data["images"], "related_event_id")
+    data["messages_by_user"] = group_by(data["messages"], "user_id")
     data["messages_by_request"] = group_by(data["messages"], "request_id")
     data["fx"] = ExchangeRateTable(data["exchange_rates"])
     return data
+
+
+# ---------------------------------------------------------------------------
+# Per-request processing
+# ---------------------------------------------------------------------------
+
+def _get_messages_for_request(data: dict, user_id: str, request_id: str) -> list[dict]:
+    """Return all messages relevant to this user/request (by user_id, any request_id)."""
+    return data["messages_by_user"].get(user_id, [])
 
 
 def process_request(data: dict, request: dict) -> dict:
@@ -101,11 +251,16 @@ def process_request(data: dict, request: dict) -> dict:
         return fallback_row(request_id, f"No financial profile found for {user_id}.")
 
     request_date = request["request_date"]
-    requested_amount = safe_float(request["requested_amount"], 0.0)
-    minimum_balance_to_keep = safe_float(profile.get("minimum_balance_to_keep"), 0.0)
-    start_balance = safe_float(profile.get("current_available_balance"), 0.0)
+    requested_amount: float = safe_float(request["requested_amount"], 0.0) or 0.0
+    minimum_balance_to_keep: float = safe_float(profile.get("minimum_balance_to_keep"), 0.0) or 0.0
+    start_balance: float = safe_float(profile.get("current_available_balance"), 0.0) or 0.0
+    home_currency = (profile.get("home_currency") or "").strip()
 
     window_end = format_date(parse_date(request_date) + timedelta(days=FORECAST_DAYS))
+
+    # Parse messages for this user to extract salary signals
+    messages = _get_messages_for_request(data, user_id, request_id)
+    signals = _extract_salary_signals(messages, request_date)
 
     raw_events = data["events_by_user"].get(user_id, [])
     events = build_user_forward_events(
@@ -115,19 +270,16 @@ def process_request(data: dict, request: dict) -> dict:
         user_id,
         request_date,
         window_end,
+        home_currency=home_currency,
+        fx=data["fx"],
+        salary_stop=signals["salary_stop"],
+        salary_override_amount=signals["salary_override_amount"],
+        salary_override_next_date=signals["salary_override_next_date"],
     )
 
-    # NOTE: currency conversion - amounts in financial_events.csv may be in
-    # a currency other than the user's home_currency in rare cross-border
-    # cases. If your dataset only has same-currency events per user, this is
-    # a no-op; otherwise convert each ForwardEvent.amount here using
-    # data["fx"].convert(amount, date, event_currency, home_currency) before
-    # proceeding. Left as a TODO hook since events observed so far are
-    # single-currency per user.
-
-    safe_amount = amount_safe_to_pay(
+    safe_amount = round(amount_safe_to_pay(
         start_balance, events, request_date, minimum_balance_to_keep, requested_amount
-    )
+    ), 2)
     earliest_full = earliest_date_for_full_payment(
         start_balance, events, request_date, minimum_balance_to_keep, requested_amount
     )
